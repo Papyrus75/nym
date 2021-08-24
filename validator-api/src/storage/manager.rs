@@ -3,11 +3,11 @@
 
 use crate::network_monitor::monitor::summary_producer::NodeResult;
 use crate::node_status_api::models::{HistoricalUptime, Uptime};
-use crate::node_status_api::utils::ActiveNodeDayStatuses;
-use crate::node_status_api::ONE_DAY;
-use crate::storage::models::{ActiveNode, NodeStatus};
+use crate::storage::models::{
+    ActiveNode, FailedGatewayRewardChunk, FailedMixnodeRewardChunk, NodeStatus,
+    PossiblyUnrewardedGateway, PossiblyUnrewardedMixnode, RewardingReport,
+};
 use crate::storage::UnixTimestamp;
-use sqlx::types::time::OffsetDateTime;
 use std::convert::TryFrom;
 
 #[derive(Clone)]
@@ -17,6 +17,32 @@ pub(crate) struct StorageManager {
 
 // all SQL goes here
 impl StorageManager {
+    /// Tries to obtain row id of given mixnode given its identity
+    pub(crate) async fn get_mixnode_id(&self, identity: &str) -> Result<Option<i64>, sqlx::Error> {
+        let id = sqlx::query!(
+            "SELECT id FROM mixnode_details WHERE identity = ?",
+            identity
+        )
+        .fetch_optional(&self.connection_pool)
+        .await?
+        .map(|row| row.id);
+
+        Ok(id)
+    }
+
+    /// Tries to obtain row id of given gateway given its identity
+    pub(crate) async fn get_gateway_id(&self, identity: &str) -> Result<Option<i64>, sqlx::Error> {
+        let id = sqlx::query!(
+            "SELECT id FROM gateway_details WHERE identity = ?",
+            identity
+        )
+        .fetch_optional(&self.connection_pool)
+        .await?
+        .map(|row| row.id);
+
+        Ok(id)
+    }
+
     /// Tries to obtain owner value of given mixnode given its identity
     pub(crate) async fn get_mixnode_owner(
         &self,
@@ -445,7 +471,7 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Creates new entry for gatewy historical uptime
+    /// Creates new entry for gateway historical uptime
     pub(crate) async fn insert_gateway_historical_uptime(
         &self,
         node_id: i64,
@@ -463,6 +489,12 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Removes all ipv4 statuses for all mixnodes that are older than the
+    /// provided timestamp. This method is indirectly called at every reward cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `until`: timestamp specifying the purge cutoff.
     pub(crate) async fn purge_old_mixnode_ipv4_statuses(
         &self,
         timestamp: UnixTimestamp,
@@ -476,6 +508,12 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Removes all ipv6 statuses for all mixnodes that are older than the
+    /// provided timestamp. This method is indirectly called at every reward cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `until`: timestamp specifying the purge cutoff.
     pub(crate) async fn purge_old_mixnode_ipv6_statuses(
         &self,
         timestamp: UnixTimestamp,
@@ -489,6 +527,12 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Removes all ipv4 statuses for all gateways that are older than the
+    /// provided timestamp. This method is indirectly called at every reward cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `until`: timestamp specifying the purge cutoff.
     pub(crate) async fn purge_old_gateway_ipv4_statuses(
         &self,
         timestamp: UnixTimestamp,
@@ -502,6 +546,12 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Removes all ipv6 statuses for all gateways that are older than the
+    /// provided timestamp. This method is indirectly called at every reward cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `until`: timestamp specifying the purge cutoff.
     pub(crate) async fn purge_old_gateway_ipv6_statuses(
         &self,
         timestamp: UnixTimestamp,
@@ -515,14 +565,12 @@ impl StorageManager {
         Ok(())
     }
 
-    // ####################################################################################################
-    // ALL THE METHODS BELOW ARE TEMPORARY AND WILL BE REMOVED ONCE PAYMENTS ARE DONE INSIDE VALIDATOR API
-    // ####################################################################################################
-
-    // NOTE: this method will go away once we move payments into the validator-api
-    // it just helps us to get rid of having to query for reports of each node individually
     /// Returns public key, owner and id of all mixnodes that have had any ipv4 statuses submitted
-    /// since provided timestamp.
+    /// since the provided timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp`: indicates the lower bound timestamp for deciding whether given mixnode is active
     pub(crate) async fn get_all_active_mixnodes(
         &self,
         timestamp: UnixTimestamp,
@@ -548,10 +596,12 @@ impl StorageManager {
         .await
     }
 
-    // NOTE: this method will go away once we move payments into the validator-api
-    // it just helps us to get rid of having to query for reports of each node individually
     /// Returns public key, owner and id of all gateways that have had any ipv4 statuses submitted
-    /// since provided timestamp.
+    /// since the provided timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp`: indicates the lower bound timestamp for deciding whether given gateway is active
     pub(crate) async fn get_all_active_gateways(
         &self,
         timestamp: UnixTimestamp,
@@ -573,73 +623,136 @@ impl StorageManager {
         .await
     }
 
-    // NOTE: this method will go away once we move payments into the validator-api
-    // it just helps us to get rid of having to query for reports of each node individually
-    // TODO: should that live on the 'Inner' struct or should it rather exist on the actual storage struct
-    // since technically it doesn't touch any SQL directly
-    pub(crate) async fn get_all_active_mixnodes_statuses(
+    /// Inserts new rewarding report into the database. Returns id of the newly created entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `report`: report to insert into the database
+    pub(crate) async fn insert_rewarding_report(
         &self,
-    ) -> Result<Vec<ActiveNodeDayStatuses>, sqlx::Error> {
-        let now = OffsetDateTime::now_utc();
-        let day_ago = (now - ONE_DAY).unix_timestamp();
+        report: RewardingReport,
+    ) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query!(
+            r#"
+                INSERT INTO rewarding_report
+                (timestamp, eligible_mixnodes, eligible_gateways, possibly_unrewarded_mixnodes, possibly_unrewarded_gateways)
+                VALUES (?, ?, ?, ?, ?);
+            "#,
+            report.timestamp,
+            report.eligible_mixnodes,
+            report.eligible_gateways,
+            report.possibly_unrewarded_mixnodes,
+            report.possibly_unrewarded_gateways,
+        )
+            .execute(&self.connection_pool)
+            .await?;
 
-        let active_nodes = self.get_all_active_mixnodes(day_ago).await?;
-
-        let mut active_day_statuses = Vec::with_capacity(active_nodes.len());
-        for active_node in active_nodes.into_iter() {
-            let ipv4_statuses = self
-                .get_mixnode_ipv4_statuses_since_by_id(active_node.id, day_ago)
-                .await?;
-            let ipv6_statuses = self
-                .get_mixnode_ipv6_statuses_since_by_id(active_node.id, day_ago)
-                .await?;
-
-            let statuses = ActiveNodeDayStatuses {
-                identity: active_node.identity,
-                owner: active_node.owner,
-                node_id: active_node.id,
-                ipv4_statuses,
-                ipv6_statuses,
-            };
-
-            active_day_statuses.push(statuses);
-        }
-
-        Ok(active_day_statuses)
+        Ok(res.last_insert_rowid())
     }
 
-    // NOTE: this method will go away once we move payments into the validator-api
-    // it just helps us to get rid of having to query for reports of each node individually
-    // TODO: should that live on the 'Inner' struct or should it rather exist on the actual storage struct
-    // since technically it doesn't touch any SQL directly
-    pub(crate) async fn get_all_active_gateways_statuses(
+    /// Tries to obtain the most recent rewarding report currently stored.
+    ///
+    /// Returns None if no report exists.
+    pub(crate) async fn get_most_recent_rewarding_report(
         &self,
-    ) -> Result<Vec<ActiveNodeDayStatuses>, sqlx::Error> {
-        let now = OffsetDateTime::now_utc();
-        let day_ago = (now - ONE_DAY).unix_timestamp();
+    ) -> Result<Option<RewardingReport>, sqlx::Error> {
+        sqlx::query!(
+            r#"
+                SELECT timestamp, eligible_mixnodes, eligible_gateways, possibly_unrewarded_mixnodes, possibly_unrewarded_gateways
+                FROM rewarding_report
+                ORDER BY timestamp DESC
+                LIMIT 1
+            "#,
+        )
+            .fetch_optional(&self.connection_pool)
+            .await.map(|optional_row| optional_row.map(|row| RewardingReport {
+            timestamp: row.timestamp,
+            eligible_mixnodes: row.eligible_mixnodes,
+            eligible_gateways: row.eligible_gateways,
+            possibly_unrewarded_mixnodes: row.possibly_unrewarded_mixnodes,
+            possibly_unrewarded_gateways: row.possibly_unrewarded_gateways,
+        }))
+    }
 
-        let active_nodes = self.get_all_active_gateways(day_ago).await?;
+    /// Inserts new failed mixnode reward chunk information into the database.
+    /// Returns id of the newly created entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `failed_chunk`: chunk information to insert.
+    pub(crate) async fn insert_failed_mixnode_reward_chunk(
+        &self,
+        failed_chunk: FailedMixnodeRewardChunk,
+    ) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query!(
+            r#"
+                INSERT INTO failed_mixnode_reward_chunk (error_message, reward_summary_id) VALUES (?, ?)
+            "#,
+            failed_chunk.error_message,
+            failed_chunk.report_id,
+        ).execute(&self.connection_pool).await?;
 
-        let mut active_day_statuses = Vec::with_capacity(active_nodes.len());
-        for active_node in active_nodes.into_iter() {
-            let ipv4_statuses = self
-                .get_gateway_ipv4_statuses_since_by_id(active_node.id, day_ago)
-                .await?;
-            let ipv6_statuses = self
-                .get_gateway_ipv6_statuses_since_by_id(active_node.id, day_ago)
-                .await?;
+        Ok(res.last_insert_rowid())
+    }
 
-            let statuses = ActiveNodeDayStatuses {
-                identity: active_node.identity,
-                owner: active_node.owner,
-                node_id: active_node.id,
-                ipv4_statuses,
-                ipv6_statuses,
-            };
+    /// Inserts new failed gateway reward chunk information into the database.
+    /// Returns id of the newly created entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `failed_chunk`: chunk information to insert.
+    pub(crate) async fn insert_failed_gateway_reward_chunk(
+        &self,
+        failed_chunk: FailedGatewayRewardChunk,
+    ) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query!(
+            r#"
+                INSERT INTO failed_gateway_reward_chunk (error_message, reward_summary_id) VALUES (?, ?)
+            "#,
+            failed_chunk.error_message,
+            failed_chunk.report_id,
+        ).execute(&self.connection_pool).await?;
 
-            active_day_statuses.push(statuses);
-        }
+        Ok(res.last_insert_rowid())
+    }
 
-        Ok(active_day_statuses)
+    /// Inserts information into the database about a mixnode that might have been unfairly unrewarded this epoch.
+    ///
+    /// # Arguments
+    ///
+    /// * `mixnode`: mixnode information to insert.
+    pub(crate) async fn insert_possibly_unrewarded_mixnode(
+        &self,
+        mixnode: PossiblyUnrewardedMixnode,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"
+                INSERT INTO possibly_unrewarded_mixnode (identity, uptime, failed_mixnode_reward_chunk_id) VALUES (?, ?, ?)
+            "#,
+            mixnode.identity,
+            mixnode.uptime,
+            mixnode.chunk_id
+        ).execute(&self.connection_pool).await?;
+        Ok(())
+    }
+
+    /// Inserts information into the database about a gateway that might have been unfairly unrewarded this epoch.
+    ///
+    /// # Arguments
+    ///
+    /// * `gateway`: mixnode information to insert.
+    pub(crate) async fn insert_possibly_unrewarded_gateway(
+        &self,
+        gateway: PossiblyUnrewardedGateway,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"
+                INSERT INTO possibly_unrewarded_gateway (identity, uptime, failed_gateway_reward_chunk_id) VALUES (?, ?, ?)
+            "#,
+            gateway.identity,
+            gateway.uptime,
+            gateway.chunk_id
+        ).execute(&self.connection_pool).await?;
+        Ok(())
     }
 }

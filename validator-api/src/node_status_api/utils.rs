@@ -4,14 +4,12 @@
 use crate::node_status_api::models::Uptime;
 use crate::node_status_api::{FIFTEEN_MINUTES, ONE_HOUR};
 use crate::storage::models::NodeStatus;
-use sqlx::types::time::OffsetDateTime;
+use time::OffsetDateTime;
 
 // A temporary helper struct used to produce reports for active nodes.
 pub(crate) struct ActiveNodeDayStatuses {
     pub(crate) identity: String,
     pub(crate) owner: String,
-    pub(crate) node_id: i64,
-
     pub(crate) ipv4_statuses: Vec<NodeStatus>,
     pub(crate) ipv6_statuses: Vec<NodeStatus>,
 }
@@ -32,6 +30,7 @@ impl NodeUptimes {
     pub(crate) fn calculate_from_last_day_reports(
         last_day_ipv4: Vec<NodeStatus>,
         last_day_ipv6: Vec<NodeStatus>,
+        // additional field: number of total monitor runs
     ) -> Self {
         let now = OffsetDateTime::now_utc();
         let hour_ago = (now - ONE_HOUR).unix_timestamp();
