@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::fmt::{self, Display, Formatter};
 use std::io::Cursor;
+use time::OffsetDateTime;
 
 // todo: put into some error enum
 #[derive(Debug)]
@@ -90,13 +91,21 @@ pub struct MixnodeStatusReport {
 
 impl MixnodeStatusReport {
     pub(crate) fn construct_from_last_day_reports(
+        report_time: OffsetDateTime,
         identity: String,
         owner: String,
         last_day_ipv4: Vec<NodeStatus>,
         last_day_ipv6: Vec<NodeStatus>,
+        last_hour_test_runs: usize,
+        last_day_test_runs: usize,
     ) -> Self {
-        let node_uptimes =
-            NodeUptimes::calculate_from_last_day_reports(last_day_ipv4, last_day_ipv6);
+        let node_uptimes = NodeUptimes::calculate_from_last_day_reports(
+            report_time,
+            last_day_ipv4,
+            last_day_ipv6,
+            last_hour_test_runs,
+            last_day_test_runs,
+        );
 
         MixnodeStatusReport {
             identity,
@@ -128,13 +137,21 @@ pub struct GatewayStatusReport {
 
 impl GatewayStatusReport {
     pub(crate) fn construct_from_last_day_reports(
+        report_time: OffsetDateTime,
         identity: String,
         owner: String,
         last_day_ipv4: Vec<NodeStatus>,
         last_day_ipv6: Vec<NodeStatus>,
+        last_hour_test_runs: usize,
+        last_day_test_runs: usize,
     ) -> Self {
-        let node_uptimes =
-            NodeUptimes::calculate_from_last_day_reports(last_day_ipv4, last_day_ipv6);
+        let node_uptimes = NodeUptimes::calculate_from_last_day_reports(
+            report_time,
+            last_day_ipv4,
+            last_day_ipv6,
+            last_hour_test_runs,
+            last_day_test_runs,
+        );
 
         GatewayStatusReport {
             identity,

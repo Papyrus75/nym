@@ -3,6 +3,7 @@
 
 use crate::network_monitor::monitor::summary_producer::NodeResult;
 use crate::node_status_api::models::{HistoricalUptime, Uptime};
+use crate::node_status_api::utils::ActiveNodeDayStatuses;
 use crate::storage::models::{
     ActiveNode, FailedGatewayRewardChunk, FailedMixnodeRewardChunk, NodeStatus,
     PossiblyUnrewardedGateway, PossiblyUnrewardedMixnode, RewardingReport,
@@ -489,6 +490,43 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Creates a database entry for a finished network monitor test run.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp`: unix timestamp at which the monitor test run has occurred
+    pub(crate) async fn insert_monitor_run(
+        &self,
+        timestamp: UnixTimestamp,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!("INSERT INTO monitor_run(timestamp) VALUES (?)", timestamp)
+            .execute(&self.connection_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Obtains number of network monitor test runs that have occurred within the specified interval.
+    ///
+    /// # Arguments
+    ///
+    /// * `since`: unix timestamp indicating the lower bound interval of the selection.
+    /// * `until`: unix timestamp indicating the upper bound interval of the selection.
+    pub(crate) async fn get_monitor_runs_count(
+        &self,
+        since: UnixTimestamp,
+        until: UnixTimestamp,
+    ) -> Result<i32, sqlx::Error> {
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM monitor_run WHERE timestamp > ? AND timestamp < ?",
+            since,
+            until,
+        )
+        .fetch_one(&self.connection_pool)
+        .await?
+        .count;
+        Ok(count)
+    }
+
     /// Removes all ipv4 statuses for all mixnodes that are older than the
     /// provided timestamp. This method is indirectly called at every reward cycle.
     ///
@@ -754,5 +792,61 @@ impl StorageManager {
             gateway.chunk_id
         ).execute(&self.connection_pool).await?;
         Ok(())
+    }
+
+    pub(crate) async fn get_all_active_mixnodes_statuses(
+        &self,
+        since: UnixTimestamp,
+    ) -> Result<Vec<ActiveNodeDayStatuses>, sqlx::Error> {
+        let active_nodes = self.get_all_active_mixnodes(since).await?;
+
+        let mut active_day_statuses = Vec::with_capacity(active_nodes.len());
+        for active_node in active_nodes.into_iter() {
+            let ipv4_statuses = self
+                .get_mixnode_ipv4_statuses_since_by_id(active_node.id, since)
+                .await?;
+            let ipv6_statuses = self
+                .get_mixnode_ipv6_statuses_since_by_id(active_node.id, since)
+                .await?;
+
+            let statuses = ActiveNodeDayStatuses {
+                identity: active_node.identity,
+                owner: active_node.owner,
+                ipv4_statuses,
+                ipv6_statuses,
+            };
+
+            active_day_statuses.push(statuses);
+        }
+
+        Ok(active_day_statuses)
+    }
+
+    pub(crate) async fn get_all_active_gateways_statuses(
+        &self,
+        since: UnixTimestamp,
+    ) -> Result<Vec<ActiveNodeDayStatuses>, sqlx::Error> {
+        let active_nodes = self.get_all_active_gateways(since).await?;
+
+        let mut active_day_statuses = Vec::with_capacity(active_nodes.len());
+        for active_node in active_nodes.into_iter() {
+            let ipv4_statuses = self
+                .get_gateway_ipv4_statuses_since_by_id(active_node.id, since)
+                .await?;
+            let ipv6_statuses = self
+                .get_gateway_ipv6_statuses_since_by_id(active_node.id, since)
+                .await?;
+
+            let statuses = ActiveNodeDayStatuses {
+                identity: active_node.identity,
+                owner: active_node.owner,
+                ipv4_statuses,
+                ipv6_statuses,
+            };
+
+            active_day_statuses.push(statuses);
+        }
+
+        Ok(active_day_statuses)
     }
 }
